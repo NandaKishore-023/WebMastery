@@ -1,7 +1,7 @@
 
-import React, { useEffect, useState, useRef, useLayoutEffect } from 'react';
+import React, { useEffect, useState, useRef, useLayoutEffect, useMemo } from 'react';
 import { SubTopic, Chapter, Subject } from '../types';
-import { generateTopicContentById, generateSummaryForTopic, generateQuizForTopic } from '../services/geminiService';
+import { generateTopicContentById, generateSummaryForTopic, generateQuizForTopic, generateSpeechForText } from '../services/geminiService';
 import MarkdownRenderer from './MarkdownRenderer';
 import QuizView from './QuizView';
 import { Loader2, BookOpenCheck, RefreshCw, Volume2, StopCircle, Play, Pause, FileText, BookOpen, Settings, Sparkles, Copy, Check } from 'lucide-react';
@@ -12,6 +12,25 @@ interface TopicContentProps {
   subject: Subject;
 }
 
+// Gemini Voices
+const GEMINI_VOICES = [
+  { name: 'Kore', label: 'Kore (Balanced)' },
+  { name: 'Puck', label: 'Puck (Energetic)' },
+  { name: 'Charon', label: 'Charon (Deep)' },
+  { name: 'Fenrir', label: 'Fenrir (Authoritative)' },
+  { name: 'Zephyr', label: 'Zephyr (Calm)' },
+];
+
+interface AudioSegment {
+  id: number;
+  text: string;
+  words: string[];
+  audioBuffer: AudioBuffer | null;
+  status: 'idle' | 'loading' | 'ready' | 'error';
+}
+
+type PlaybackStatus = 'idle' | 'playing' | 'paused';
+
 const TopicContent: React.FC<TopicContentProps> = ({ topic, chapter, subject }) => {
   const [activeTab, setActiveTab] = useState<'lesson' | 'summary'>('lesson');
   const [content, setContent] = useState<string | null>(null);
@@ -21,176 +40,470 @@ const TopicContent: React.FC<TopicContentProps> = ({ topic, chapter, subject }) 
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [quizLoading, setQuizLoading] = useState(false);
   const [quizContent, setQuizContent] = useState<string | null>(null);
-
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [isPaused, setIsPaused] = useState(false);
-  const [rate, setRate] = useState(1);
-  const [volume, setVolume] = useState(1);
-  const [showSettings, setShowSettings] = useState(false);
-  
-  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
-  const [selectedVoice, setSelectedVoice] = useState<SpeechSynthesisVoice | null>(null);
-  
-  const [transcriptText, setTranscriptText] = useState<string>("");
-  const [highlightRange, setHighlightRange] = useState<[number, number] | null>(null);
-
   const [copied, setCopied] = useState(false);
 
-  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
-  const synth = window.speechSynthesis;
-  const transcriptContainerRef = useRef<HTMLDivElement>(null);
-  const activeWordRef = useRef<HTMLSpanElement>(null);
+  // --- AUDIO STATE ---
+  const [playbackStatus, setPlaybackStatus] = useState<PlaybackStatus>('idle');
+  const [isBuffering, setIsBuffering] = useState(false);
+  const [activeSegmentIndex, setActiveSegmentIndex] = useState<number>(-1);
+  const [highlightedWordIndex, setHighlightedWordIndex] = useState<number>(-1);
   
-  const currentTextRef = useRef<string>("");
-  const currentCharIndexRef = useRef<number>(0);
-  const isSwitchingSettings = useRef<boolean>(false);
+  // Settings
+  const [rate, setRate] = useState(1);
+  const [volume, setVolume] = useState(1);
+  const [selectedVoiceName, setSelectedVoiceName] = useState<string>('Kore');
+  const [showSettings, setShowSettings] = useState(false);
 
-  const [cache, setCache] = useState<Record<string, string>>({});
-  const [summaryCache, setSummaryCache] = useState<Record<string, string>>({});
+  // Refs for persistent state inside async loops (Fixes volume reset bug)
+  const rateRef = useRef(rate);
+  const volumeRef = useRef(volume);
 
-  useEffect(() => {
-    const loadVoices = () => {
-      const allVoices = synth.getVoices();
-      setVoices(allVoices);
-      
-      if (allVoices.length > 0 && !selectedVoice) {
-        const preferred = allVoices.find(v => v.name.includes('Google US English')) || 
-                          allVoices.find(v => v.lang.startsWith('en')) || 
-                          allVoices[0];
-        setSelectedVoice(preferred);
-      }
-    };
+  // Data Structures
+  const [segments, setSegments] = useState<AudioSegment[]>([]);
+  
+  // Refs for Audio Engine
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
+  const gainNodeRef = useRef<GainNode | null>(null);
+  
+  const processingRef = useRef(false); // Guard for loop
+  const currentSegmentIndexRef = useRef<number>(-1); // Sync ref for loop
+  const playbackSessionIdRef = useRef(0); // Unique session ID for race condition handling
 
-    loadVoices();
-    if (speechSynthesis.onvoiceschanged !== undefined) {
-      speechSynthesis.onvoiceschanged = loadVoices;
-    }
-  }, [selectedVoice]);
+  const transcriptListRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    return () => {
-      stopAudio();
-    };
-  }, [topic]);
+  // Cache: Key = "VoiceName-SegmentTextHash" -> Buffer
+  const audioCacheRef = useRef<Map<string, AudioBuffer>>(new Map());
+  // Pending Requests: Key -> Promise (Deduplication)
+  const pendingRequestsRef = useRef<Map<string, Promise<AudioBuffer | null>>>(new Map());
 
-  useLayoutEffect(() => {
-    if (activeWordRef.current && transcriptContainerRef.current) {
-      const container = transcriptContainerRef.current;
-      const element = activeWordRef.current;
-      const containerHeight = container.clientHeight;
-      const elementTop = element.offsetTop;
-      const elementHeight = element.clientHeight;
-      
-      const scrollPos = elementTop - (containerHeight / 2) + (elementHeight / 2);
-      
-      container.scrollTo({
-        top: scrollPos,
-        behavior: 'smooth'
-      });
-    }
-  }, [highlightRange]);
+  // --- INITIALIZATION ---
 
   useEffect(() => {
-    if (isPlaying && !isPaused) {
-      const timeoutId = setTimeout(() => {
-        isSwitchingSettings.current = true;
-        synth.cancel();
-        
-        const previousText = currentTextRef.current;
-        const lastIndex = currentCharIndexRef.current;
-        
-        if (lastIndex < previousText.length) {
-            const remainingText = previousText.substring(lastIndex);
-            
-            currentTextRef.current = remainingText;
-            setTranscriptText(remainingText); 
-            currentCharIndexRef.current = 0;
-            speakChunk(remainingText);
-            
-            setTimeout(() => {
-              isSwitchingSettings.current = false;
-            }, 100);
-        } else {
-            isSwitchingSettings.current = false;
-            setIsPlaying(false);
-        }
-      }, 300); 
-
-      return () => clearTimeout(timeoutId);
-    }
-  }, [rate, volume, selectedVoice]);
-
-  const stopAudio = () => {
-    isSwitchingSettings.current = false;
-    if (synth.speaking || synth.pending || isPaused) {
-      synth.cancel();
-    }
-    setIsPlaying(false);
-    setIsPaused(false);
-    setTranscriptText("");
-    setHighlightRange(null);
-    currentTextRef.current = "";
-    currentCharIndexRef.current = 0;
-  };
-
-  const pauseAudio = () => {
-    if (synth.speaking && !synth.paused) {
-      synth.pause();
-      setIsPaused(true);
-    }
-  };
-
-  const resumeAudio = () => {
-    if (synth.paused) {
-      synth.resume();
-      setIsPaused(false);
-    }
-  };
-
-  const fetchContent = async () => {
+    // Reset everything when topic changes
     stopAudio();
+    audioCacheRef.current.clear(); // Clear cache to prevent memory leaks
+    pendingRequestsRef.current.clear();
     setQuizContent(null);
-    setTranscriptText("");
-    setHighlightRange(null);
     setActiveTab('lesson'); 
     setCopied(false);
     
-    if (cache[topic.id]) {
-      setContent(cache[topic.id]);
-      return;
-    }
+    const loadContent = async () => {
+      setLoading(true);
+      const text = await generateTopicContentById(topic.id, topic.title, chapter.title, subject.id);
+      setContent(text);
+      setLoading(false);
+    };
 
-    setLoading(true);
-    const generatedText = await generateTopicContentById(topic.id, topic.title, chapter.title, subject.id);
-    setContent(generatedText);
-    setCache(prev => ({ ...prev, [topic.id]: generatedText }));
-    setLoading(false);
+    loadContent();
+  }, [topic.id]);
+
+  // When content loads, parse it into segments immediately
+  useEffect(() => {
+    const textToParse = activeTab === 'lesson' ? content : summaryContent;
+    if (textToParse) {
+      parseTextToSegments(textToParse);
+    } else {
+      setSegments([]);
+    }
+    stopAudio();
+  }, [content, summaryContent, activeTab]);
+
+  // Sync refs with state for async loop access
+  useEffect(() => {
+    rateRef.current = rate;
+    volumeRef.current = volume;
+    
+    // Real-time update for current node if playing
+    if (sourceNodeRef.current) {
+        try { sourceNodeRef.current.playbackRate.value = rate; } catch(e) {}
+    }
+    // Instant volume update
+    if (gainNodeRef.current && audioContextRef.current) {
+        try { 
+            gainNodeRef.current.gain.setTargetAtTime(volume, audioContextRef.current.currentTime, 0.1); 
+        } catch(e) {}
+    }
+  }, [rate, volume]);
+
+  // When Voice Changes, restart playback seamlessly if playing
+  useEffect(() => {
+    if (playbackStatus !== 'idle') {
+      const currentIndex = activeSegmentIndex >= 0 ? activeSegmentIndex : 0;
+      stopAudio();
+      // Slight delay to ensure cleanup
+      setTimeout(() => {
+         playFromSegment(currentIndex);
+      }, 50);
+    }
+  }, [selectedVoiceName]);
+
+  // --- OPTIMIZATION: PRE-WARMING CACHE ---
+  // Automatically start fetching the first few chunks as soon as segments are ready
+  useEffect(() => {
+    if (segments.length > 0 && selectedVoiceName) {
+      // Pre-fetch the first 3 segments immediately
+      // This ensures that when the user clicks play, audio is likely already there
+      fetchAudioForSegment(0);
+      fetchAudioForSegment(1);
+      fetchAudioForSegment(2);
+    }
+  }, [segments, selectedVoiceName]);
+
+
+  // --- PARSING LOGIC ---
+
+  const parseTextToSegments = (markdown: string) => {
+    // Remove code blocks to avoid reading syntax
+    const noCode = markdown.replace(/```[\s\S]*?```/g, '');
+    
+    // Clean Markdown symbols
+    const cleanText = noCode
+      .replace(/[#*`_\[\]]/g, '') // remove formatting chars
+      .replace(/\n+/g, ' ')       // replace newlines with spaces
+      .replace(/\s+/g, ' ')       // collapse spaces
+      .trim();
+
+    // 1. Initial Split by Sentence
+    const rawSentences = cleanText.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [];
+    
+    // 2. OPTIMIZATION: Smart Merge
+    // Merging short sentences into larger chunks (e.g., paragraphs) 
+    // reduces the number of API requests significantly (less buffering).
+    // Target Chunk Size: ~150-200 chars
+    const mergedSentences: string[] = [];
+    let currentChunk = "";
+    
+    for (const sentence of rawSentences) {
+        const trimmed = sentence.trim();
+        if (!trimmed) continue;
+        
+        // If current chunk is small, append next sentence
+        if (currentChunk.length + trimmed.length < 180) {
+            currentChunk += (currentChunk ? " " : "") + trimmed;
+        } else {
+            // Push current chunk and start new one
+            if (currentChunk) mergedSentences.push(currentChunk);
+            currentChunk = trimmed;
+        }
+    }
+    if (currentChunk) mergedSentences.push(currentChunk);
+
+    const newSegments: AudioSegment[] = mergedSentences
+      .map(s => s.trim())
+      .filter(s => s.length > 0)
+      .map((text, idx) => ({
+        id: idx,
+        text: text,
+        words: text.split(' '),
+        audioBuffer: null,
+        status: 'idle'
+      }));
+
+    setSegments(newSegments);
   };
 
-  const fetchSummary = async () => {
-    if (summaryCache[topic.id]) {
-      setSummaryContent(summaryCache[topic.id]);
-      return;
+  // --- AUDIO ENGINE ---
+
+  // 1. Get Context (Passive) - Does NOT resume if suspended
+  const getAudioContext = () => {
+    if (!audioContextRef.current) {
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      audioContextRef.current = new AudioContextClass({ sampleRate: 24000 });
+    }
+    return audioContextRef.current;
+  };
+
+  // 2. Resume Context (Active) - Call this only on explicit user Play/Resume
+  const resumeAudioContext = async () => {
+    const ctx = getAudioContext();
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
+    }
+    return ctx;
+  };
+
+  const decodeAudio = async (base64: string, ctx: AudioContext) => {
+    const binary = atob(base64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+    
+    const pcmData = new Int16Array(bytes.buffer);
+    const audioBuffer = ctx.createBuffer(1, pcmData.length, 24000);
+    const channelData = audioBuffer.getChannelData(0);
+    for (let i = 0; i < pcmData.length; i++) {
+      channelData[i] = pcmData[i] / 32768.0;
+    }
+    return audioBuffer;
+  };
+
+  const fetchAudioForSegment = async (index: number): Promise<AudioBuffer | null> => {
+    if (index < 0 || index >= segments.length) return null;
+    
+    const segment = segments[index];
+    // Hash-like key to separate voices and content
+    const cacheKey = `${selectedVoiceName}-${segment.text.substring(0, 30)}-${index}`;
+
+    // 1. Check Result Cache
+    if (audioCacheRef.current.has(cacheKey)) {
+      return audioCacheRef.current.get(cacheKey)!;
     }
 
+    // 2. Check Pending Request Cache (Deduplication)
+    if (pendingRequestsRef.current.has(cacheKey)) {
+      return pendingRequestsRef.current.get(cacheKey)!;
+    }
+
+    // Only fetch if we have text
+    if (!segment.text) return null;
+
+    // 3. Initiate New Request
+    const fetchPromise = (async () => {
+      try {
+        const base64 = await generateSpeechForText(segment.text, selectedVoiceName);
+        if (!base64) return null;
+
+        // Use getAudioContext() so we don't accidentally resume the context while buffering in background
+        const ctx = getAudioContext();
+        const buffer = await decodeAudio(base64, ctx);
+        
+        audioCacheRef.current.set(cacheKey, buffer);
+        return buffer;
+      } catch (err) {
+        console.error("Fetch audio error:", err);
+        return null;
+      } finally {
+        // Clean up pending request
+        pendingRequestsRef.current.delete(cacheKey);
+      }
+    })();
+
+    pendingRequestsRef.current.set(cacheKey, fetchPromise);
+    return fetchPromise;
+  };
+
+  // The Main Loop
+  const playFromSegment = async (startIndex: number) => {
+    // Invalidate previous sessions
+    playbackSessionIdRef.current += 1;
+    const currentSessionId = playbackSessionIdRef.current;
+
+    processingRef.current = true;
+    
+    // Explicitly resume context here because user requested playback
+    const ctx = await resumeAudioContext();
+
+    currentSegmentIndexRef.current = startIndex;
+    setPlaybackStatus('playing');
+
+    try {
+      while (currentSegmentIndexRef.current < segments.length) {
+        // RACE CHECK: If session changed, abort immediately
+        if (currentSessionId !== playbackSessionIdRef.current) break;
+
+        const index = currentSegmentIndexRef.current;
+        setActiveSegmentIndex(index);
+        
+        // 1. Fetch Current (Buffering State)
+        const segment = segments[index];
+        const cacheKey = `${selectedVoiceName}-${segment.text.substring(0, 30)}-${index}`;
+        
+        if (!audioCacheRef.current.has(cacheKey)) {
+             setIsBuffering(true);
+        }
+
+        let buffer = await fetchAudioForSegment(index);
+        
+        setIsBuffering(false);
+
+        // RACE CHECK
+        if (currentSessionId !== playbackSessionIdRef.current) break;
+
+        // 2. OPTIMIZATION: Aggressive Look-Ahead (Background)
+        // Fetch next 5 segments to prevent buffering gaps
+        for (let i = 1; i <= 5; i++) {
+           fetchAudioForSegment(index + i);
+        }
+
+        if (!buffer) {
+          // If fetch failed, skip segment
+          currentSegmentIndexRef.current++;
+          continue;
+        }
+
+        // 3. Play
+        await new Promise<void>((resolve) => {
+          if (currentSessionId !== playbackSessionIdRef.current) {
+            resolve();
+            return;
+          }
+
+          const source = ctx.createBufferSource();
+          source.buffer = buffer;
+          
+          source.playbackRate.value = rateRef.current;
+          
+          const gainNode = ctx.createGain();
+          gainNode.gain.value = volumeRef.current;
+          gainNodeRef.current = gainNode; // Store ref for instant update
+
+          source.connect(gainNode);
+          gainNode.connect(ctx.destination);
+          
+          sourceNodeRef.current = source;
+          
+          // Heuristic Animation
+          const startTime = ctx.currentTime;
+          const duration = buffer.duration / rateRef.current;
+          const wordCount = segments[index].words.length;
+          
+          let animationFrameId: number;
+          
+          const updateHighlight = () => {
+            if (currentSessionId !== playbackSessionIdRef.current) return;
+            
+            // Handle Pause State (Suspended Context)
+            if (ctx.state === 'suspended') {
+                 animationFrameId = requestAnimationFrame(updateHighlight);
+                 return;
+            }
+
+            const elapsed = ctx.currentTime - startTime;
+            const progress = Math.min(elapsed / duration, 1);
+            
+            // Map progress to word index
+            const wordIdx = Math.floor(progress * wordCount);
+            setHighlightedWordIndex(wordIdx);
+
+            if (progress < 1) {
+              animationFrameId = requestAnimationFrame(updateHighlight);
+            }
+          };
+          
+          animationFrameId = requestAnimationFrame(updateHighlight);
+
+          source.onended = () => {
+            cancelAnimationFrame(animationFrameId);
+            setHighlightedWordIndex(-1);
+            sourceNodeRef.current = null;
+            gainNodeRef.current = null;
+            resolve(); // Next sentence
+          };
+
+          source.start(0);
+        });
+
+        // 4. Advance
+        if (currentSessionId === playbackSessionIdRef.current) {
+           currentSegmentIndexRef.current++;
+        }
+      }
+    } catch (e) {
+      console.error("Playback error", e);
+    } finally {
+      // Only reset UI if this session is the active one and it finished naturally
+      if (currentSessionId === playbackSessionIdRef.current) {
+          setPlaybackStatus('idle');
+          setActiveSegmentIndex(-1);
+          setIsBuffering(false);
+      }
+      if (currentSessionId === playbackSessionIdRef.current) {
+          processingRef.current = false;
+      }
+    }
+  };
+
+  const handlePause = async () => {
+    const ctx = getAudioContext();
+    if (ctx.state === 'running') {
+      await ctx.suspend();
+      setPlaybackStatus('paused');
+    }
+  };
+
+  const handleResume = async () => {
+    const ctx = getAudioContext();
+    
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
+      setPlaybackStatus('playing');
+    } else if (playbackStatus === 'idle') {
+      playFromSegment(0);
+    }
+  };
+
+  const stopAudio = () => {
+    // Increment session ID to invalidate any running loops
+    playbackSessionIdRef.current += 1;
+    
+    if (sourceNodeRef.current) {
+      try { sourceNodeRef.current.stop(); } catch(e){}
+    }
+    if (audioContextRef.current) {
+       try { audioContextRef.current.suspend(); } catch(e){}
+    }
+    
+    sourceNodeRef.current = null;
+    gainNodeRef.current = null;
+    
+    setPlaybackStatus('idle');
+    setActiveSegmentIndex(-1);
+    setHighlightedWordIndex(-1);
+    setIsBuffering(false);
+    processingRef.current = false;
+  };
+
+  const handleTogglePlay = () => {
+    if (playbackStatus === 'playing') {
+      stopAudio(); // Stop button action
+    } else {
+      // Start a new session
+      playFromSegment(0);
+    }
+  };
+  
+  const handleSegmentClick = (index: number) => {
+    stopAudio();
+    // Allow state to clear
+    setTimeout(() => {
+      playFromSegment(index);
+    }, 10);
+  };
+
+  // --- AUTO SCROLL ---
+  useEffect(() => {
+    if (activeSegmentIndex >= 0 && transcriptListRef.current) {
+       const container = transcriptListRef.current;
+       const activeEl = container.children[activeSegmentIndex] as HTMLElement;
+       
+       if (activeEl) {
+         // Calculate scroll position manually to avoid scrolling the main window
+         // We center the active element within the container
+         const elementTop = activeEl.offsetTop;
+         const elementHeight = activeEl.clientHeight;
+         const containerHeight = container.clientHeight;
+         
+         container.scrollTo({
+           top: elementTop - containerHeight / 2 + elementHeight / 2,
+           behavior: 'smooth'
+         });
+       }
+    }
+  }, [activeSegmentIndex]);
+
+  // --- HELPER FETCHERS ---
+  const fetchSummary = async () => {
+    if (summaryContent) return;
     setSummaryLoading(true);
-    const summaryText = await generateSummaryForTopic(topic.title, chapter.title);
-    setSummaryContent(summaryText);
-    setSummaryCache(prev => ({ ...prev, [topic.id]: summaryText }));
+    const text = await generateSummaryForTopic(topic.title, chapter.title);
+    setSummaryContent(text);
     setSummaryLoading(false);
   };
 
-  useEffect(() => {
-    fetchContent();
-  }, [topic, chapter, subject.id]);
-
   const handleTabChange = (tab: 'lesson' | 'summary') => {
-    stopAudio(); 
     setActiveTab(tab);
-    setCopied(false);
-    if (tab === 'summary' && !summaryContent) {
-      fetchSummary();
-    }
+    if (tab === 'summary' && !summaryContent) fetchSummary();
   };
 
   const handleGenerateQuiz = async () => {
@@ -203,263 +516,170 @@ const TopicContent: React.FC<TopicContentProps> = ({ topic, chapter, subject }) 
 
   const handleCopy = async (text: string | null) => {
     if (!text) return;
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      console.error('Failed to copy', err);
-    }
+    navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
   };
 
-  const cleanTextForSpeech = (rawText: string): string => {
-    return rawText
-      .replace(/[*#`_\[\]]/g, '') 
-      .replace(/<[^>]*>?/gm, '') 
-      .replace(/\n\s*\n/g, '. ') 
-      .trim();
-  };
+  // --- REUSABLE COMPONENTS ---
 
-  const speakChunk = (text: string) => {
-      if (!text.trim()) {
-          setIsPlaying(false);
-          return;
-      }
-
-      setTranscriptText(text);
-      setHighlightRange(null);
-
-      const utterance = new SpeechSynthesisUtterance(text);
-      if (selectedVoice) {
-        utterance.voice = selectedVoice;
-      }
-      
-      utterance.rate = rate;
-      utterance.volume = volume;
-      utterance.pitch = 1;
-
-      utterance.onboundary = (event) => {
-        currentCharIndexRef.current = event.charIndex;
-        const charIndex = event.charIndex;
-        let nextSpace = text.indexOf(' ', charIndex);
-        if (nextSpace === -1) nextSpace = text.length;
-        setHighlightRange([charIndex, nextSpace]);
-      };
-
-      utterance.onend = () => {
-        if (isSwitchingSettings.current) return;
-        setIsPlaying(false);
-        setIsPaused(false);
-        setHighlightRange(null);
-        currentCharIndexRef.current = 0;
-      };
-
-      utterance.onerror = (e) => {
-          console.error("Speech Error:", e);
-          if (!isSwitchingSettings.current) {
-            setIsPlaying(false);
-          }
-      }
-
-      utteranceRef.current = utterance;
-      synth.speak(utterance);
-  };
-
-  const handleSpeak = () => {
-    const textToSpeak = activeTab === 'lesson' ? content : summaryContent;
-
-    if (isPlaying) {
-      if (isPaused) {
-          resumeAudio();
-      } else {
-          pauseAudio();
-      }
-      return;
-    }
-
-    if (!textToSpeak) return;
-
-    stopAudio();
-    setTimeout(() => {
-        setIsPlaying(true);
-        const cleanText = cleanTextForSpeech(textToSpeak);
-        currentTextRef.current = cleanText;
-        currentCharIndexRef.current = 0;
-        speakChunk(cleanText);
-    }, 50);
-  };
-
-  const renderTranscript = () => {
-    if (!transcriptText || !isPlaying) return null;
-
-    let before = transcriptText;
-    let highlight = "";
-    let after = "";
-
-    if (highlightRange) {
-        const [start, end] = highlightRange;
-        before = transcriptText.substring(0, start);
-        highlight = transcriptText.substring(start, end);
-        after = transcriptText.substring(end);
-    }
-
-    return (
-      <div className="bg-white/80 dark:bg-slate-900/40 border border-indigo-200 dark:border-indigo-500/30 rounded-2xl overflow-hidden mb-8 shadow-2xl backdrop-blur-xl flex flex-col relative group transition-colors">
-         <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-indigo-500 to-purple-500"></div>
-         
-         <div className="p-3 bg-white/90 dark:bg-slate-900/60 border-b border-indigo-100 dark:border-white/5 flex justify-between items-center">
-             <h4 className="text-xs text-indigo-600 dark:text-indigo-300 uppercase font-bold flex items-center gap-2">
-                <Volume2 className="w-4 h-4 text-indigo-500 dark:text-indigo-400 animate-pulse" /> Live Transcript
-             </h4>
+  const renderTranscriptList = () => (
+    <div className="my-8 bg-white/50 dark:bg-slate-900/50 border border-slate-200 dark:border-white/5 rounded-2xl overflow-hidden shadow-lg backdrop-blur-md">
+       <div className="p-3 bg-indigo-50/50 dark:bg-white/5 border-b border-indigo-100 dark:border-white/5 flex justify-between items-center">
+         <h4 className="text-xs font-bold text-indigo-600 dark:text-indigo-300 uppercase flex items-center gap-2">
+           <Volume2 size={14} /> Interactive Transcript
+         </h4>
+         <div className="flex items-center gap-3">
+            {isBuffering && (
+               <span className="text-xs font-bold text-indigo-500 animate-pulse flex items-center gap-1">
+                 <Loader2 size={12} className="animate-spin" /> Buffering...
+               </span>
+            )}
+            <span className="text-xs text-slate-400">{segments.length} Segments</span>
          </div>
+       </div>
+       {/* Added relative positioning to container for correct offsetTop calculations */}
+       <div ref={transcriptListRef} className="max-h-[300px] overflow-y-auto p-4 space-y-2 scroll-smooth relative">
+          {segments.map((seg, idx) => {
+             const isActive = idx === activeSegmentIndex;
+             return (
+               <div 
+                 key={idx}
+                 onClick={() => handleSegmentClick(idx)}
+                 className={`p-3 rounded-lg cursor-pointer transition-all duration-300 text-sm leading-relaxed border ${
+                   isActive 
+                     ? 'bg-indigo-600 text-white shadow-lg scale-[1.02] border-indigo-500 z-10' 
+                     : 'bg-transparent text-slate-600 dark:text-slate-400 border-transparent hover:bg-slate-100 dark:hover:bg-white/5'
+                 }`}
+               >
+                 {isActive ? (
+                    <span>
+                      {seg.words.map((word, wIdx) => (
+                        <span 
+                          key={wIdx} 
+                          className={`transition-opacity duration-200 ${wIdx === highlightedWordIndex ? 'bg-yellow-400/30 text-white font-bold px-0.5 rounded' : 'opacity-90'}`}
+                        >
+                          {word}{' '}
+                        </span>
+                      ))}
+                    </span>
+                 ) : (
+                    <span>{seg.text}</span>
+                 )}
+               </div>
+             );
+          })}
+          {segments.length === 0 && <p className="text-slate-400 text-center italic p-4">Audio transcript not available.</p>}
+       </div>
+    </div>
+  );
 
-         <div 
-           ref={transcriptContainerRef}
-           className="h-48 overflow-y-auto p-6 scroll-smooth text-lg leading-relaxed font-medium font-serif"
-         >
-           <p className="text-slate-500 dark:text-slate-300/60 transition-colors duration-300">
-             {before}
-             {highlight && (
-                 <span 
-                   ref={activeWordRef}
-                   className="bg-indigo-500 text-white px-1 py-0.5 rounded shadow-[0_0_15px_rgba(99,102,241,0.5)] mx-0.5 inline-block scale-110 transition-all duration-200 ease-out"
-                 >
-                   {highlight}
-                 </span>
-             )}
-             {after}
-           </p>
-         </div>
-         
-         <div className="absolute bottom-0 left-0 w-full h-8 bg-gradient-to-t from-white dark:from-slate-900/80 to-transparent pointer-events-none"></div>
-      </div>
-    );
-  };
-
-  const renderAudioControls = (textAvailable: boolean) => (
-    <>
-      <div className="mb-6 animate-fade-in">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
-            <div className="flex items-center gap-2">
-              {textAvailable && (
-                <>
-                  <button
-                    onClick={handleSpeak}
-                    className={`flex items-center gap-2 px-5 py-2.5 rounded-xl font-bold transition-all shadow-lg min-w-[130px] justify-center transform hover:scale-105 ${
-                      isPlaying && !isPaused
-                        ? 'bg-gradient-to-r from-amber-500 to-orange-500 text-white shadow-orange-500/30' 
-                        : 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white shadow-indigo-500/30'
-                    }`}
-                  >
-                    {isPlaying && !isPaused ? (
-                      <>
+  const renderAudioControlSection = (label: string) => (
+    <div className="mb-6">
+      <div className="flex flex-wrap items-center gap-4 mb-4">
+        {/* PLAY / PAUSE / RESUME */}
+        {playbackStatus === 'idle' ? (
+             <button
+                onClick={handleTogglePlay}
+                disabled={segments.length === 0}
+                className="flex items-center gap-2 px-6 py-3 rounded-xl font-bold text-white shadow-lg bg-indigo-600 hover:bg-indigo-700 shadow-indigo-500/30 transition-all transform hover:scale-105 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+             >
+                <Play className="w-5 h-5 fill-current" />
+                <span>Listen to {label}</span>
+             </button>
+        ) : (
+            <>
+               {/* Pause / Resume Button */}
+               <button
+                  onClick={playbackStatus === 'playing' ? handlePause : handleResume}
+                  className={`flex items-center gap-2 px-6 py-3 rounded-xl font-bold text-white shadow-lg transition-all transform hover:scale-105 active:scale-95 ${
+                    playbackStatus === 'playing' 
+                       ? 'bg-amber-500 hover:bg-amber-600 shadow-amber-500/30' 
+                       : 'bg-green-500 hover:bg-green-600 shadow-green-500/30'
+                  }`}
+               >
+                  {playbackStatus === 'playing' ? (
+                     <>
                         <Pause className="w-5 h-5 fill-current" />
                         <span>Pause</span>
-                      </>
-                    ) : (
-                      <>
+                     </>
+                  ) : (
+                     <>
                         <Play className="w-5 h-5 fill-current" />
-                        <span>{isPlaying && isPaused ? 'Resume' : 'Listen'}</span>
-                      </>
-                    )}
-                  </button>
-                  
-                  {isPlaying && (
-                      <button
-                      onClick={stopAudio}
-                      className="p-2.5 rounded-xl bg-red-100 dark:bg-red-500/10 text-red-600 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-500/20 border border-red-300 dark:border-red-500/30 hover:border-red-400 dark:hover:border-red-500/50 transition-all"
-                      title="Stop Audio"
-                    >
-                      <StopCircle className="w-5 h-5" />
-                    </button>
+                        <span>Resume</span>
+                     </>
                   )}
+               </button>
 
-                  <button
-                    onClick={() => setShowSettings(!showSettings)}
-                    className={`p-2.5 rounded-xl border transition-all ${
-                      showSettings 
-                        ? 'bg-indigo-600 border-indigo-500 text-white shadow-lg' 
-                        : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:text-indigo-600 dark:hover:text-white hover:border-indigo-300 dark:hover:border-slate-500'
-                    }`}
-                    title="Audio Settings"
-                  >
-                    <Settings className={`w-5 h-5 ${showSettings ? 'animate-spin-slow' : ''}`} />
-                  </button>
-                </>
-              )}
-            </div>
-        </div>
+               {/* Stop Button */}
+               <button
+                  onClick={stopAudio}
+                  className="flex items-center gap-2 px-6 py-3 rounded-xl font-bold text-white shadow-lg bg-red-500 hover:bg-red-600 shadow-red-500/30 transition-all transform hover:scale-105 active:scale-95"
+               >
+                  <StopCircle className="w-5 h-5" />
+                  <span>Stop</span>
+               </button>
+            </>
+        )}
 
-        {showSettings && textAvailable && (
-          <div className="bg-white/90 dark:bg-slate-800/80 backdrop-blur-md border border-indigo-200 dark:border-indigo-500/30 rounded-2xl p-6 mb-6 animate-fade-in grid grid-cols-1 md:grid-cols-2 gap-8 shadow-2xl">
-            <div>
-              <div className="flex justify-between items-center mb-3">
-                <label className="text-xs font-bold text-indigo-600 dark:text-indigo-300 uppercase tracking-wider">Speed</label>
-                <span className="text-xs bg-indigo-500 text-white px-2 py-0.5 rounded-full font-bold shadow">{rate}x</span>
-              </div>
-              <input
-                type="range"
-                min="0.5"
-                max="2"
-                step="0.25"
-                value={rate}
-                onChange={(e) => setRate(parseFloat(e.target.value))}
-                className="w-full h-2 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
-              />
-            </div>
+        <button
+          onClick={() => setShowSettings(!showSettings)}
+          className={`p-3 rounded-xl border transition-all ${showSettings ? 'bg-indigo-100 border-indigo-300 text-indigo-700' : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-500'}`}
+          title="Audio Settings"
+        >
+          <Settings className={`w-5 h-5 ${showSettings ? 'rotate-90' : ''} transition-transform`} />
+        </button>
 
-            <div>
-              <div className="flex justify-between items-center mb-3">
-                <label className="text-xs font-bold text-indigo-600 dark:text-indigo-300 uppercase tracking-wider">Volume</label>
-                <span className="text-xs bg-indigo-500 text-white px-2 py-0.5 rounded-full font-bold shadow">{Math.round(volume * 100)}%</span>
-              </div>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.1"
-                value={volume}
-                onChange={(e) => setVolume(parseFloat(e.target.value))}
-                className="w-full h-2 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
-              />
+        {isBuffering && (
+            <div className="flex items-center gap-2 text-indigo-500 animate-pulse ml-2">
+                <Loader2 size={16} className="animate-spin" />
+                <span className="text-sm font-medium">Buffering audio...</span>
             </div>
-            
-            <div className="md:col-span-2 border-t border-slate-200 dark:border-white/10 pt-4">
-              <div className="flex justify-between items-center mb-2">
-                <label className="text-xs font-bold text-indigo-600 dark:text-indigo-300 uppercase tracking-wider">Voice</label>
-                <span className="text-xs text-slate-500 dark:text-slate-400">{voices.length} Available</span>
-              </div>
-              <select
-                value={selectedVoice?.name || ""}
-                onChange={(e) => {
-                  const voice = voices.find(v => v.name === e.target.value);
-                  if (voice) setSelectedVoice(voice);
-                }}
-                className="w-full bg-slate-100 dark:bg-slate-900/50 text-slate-800 dark:text-slate-200 text-sm rounded-xl p-3 border border-slate-300 dark:border-slate-600 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all"
-              >
-                {voices.length === 0 && <option>Loading voices...</option>}
-                {voices.map((voice) => (
-                  <option key={voice.name} value={voice.name}>
-                    {voice.name} ({voice.lang})
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
         )}
       </div>
 
-      {renderTranscript()}
-    </>
+      {/* Settings Panel */}
+      {showSettings && (
+        <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl p-6 mb-6 shadow-xl animate-fade-in grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div>
+            <label className="text-xs font-bold text-slate-500 uppercase mb-2 block">Speed: {rate}x</label>
+            <input type="range" min="0.5" max="2" step="0.25" value={rate} onChange={e => setRate(parseFloat(e.target.value))} className="w-full accent-indigo-600" />
+          </div>
+          <div>
+            <label className="text-xs font-bold text-slate-500 uppercase mb-2 block">Volume: {Math.round(volume*100)}%</label>
+            <input type="range" min="0" max="1" step="0.1" value={volume} onChange={e => setVolume(parseFloat(e.target.value))} className="w-full accent-indigo-600" />
+          </div>
+          <div className="md:col-span-2">
+            <label className="text-xs font-bold text-slate-500 uppercase mb-2 block">AI Voice</label>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+              {GEMINI_VOICES.map(v => (
+                <button 
+                  key={v.name}
+                  onClick={() => setSelectedVoiceName(v.name)}
+                  className={`px-3 py-2 rounded-lg text-sm font-medium border transition-all ${selectedVoiceName === v.name ? 'bg-indigo-500 text-white border-indigo-500' : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 border-transparent hover:border-slate-300'}`}
+                >
+                  {v.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Always show transcript if playing or paused */}
+      {playbackStatus !== 'idle' && renderTranscriptList()}
+    </div>
   );
 
+  // --- RENDER MAIN ---
+  
   if (loading) {
-    return (
-      <div className="flex flex-col items-center justify-center h-full text-slate-500 dark:text-slate-400">
-        <Loader2 className="w-12 h-12 animate-spin text-indigo-500 mb-4" />
-        <p className="text-lg animate-pulse">Generating comprehensive notes...</p>
-      </div>
-    );
+     return (
+       <div className="flex flex-col items-center justify-center h-full min-h-[400px]">
+         <Loader2 className="w-12 h-12 animate-spin text-indigo-500 mb-4" />
+         <p className="text-lg text-slate-500 animate-pulse">Generating your lesson...</p>
+       </div>
+     );
   }
 
   return (
@@ -500,93 +720,71 @@ const TopicContent: React.FC<TopicContentProps> = ({ topic, chapter, subject }) 
         </div>
       </div>
 
-      {/* LESSON TAB CONTENT */}
+      {/* LESSON TAB */}
       {activeTab === 'lesson' && (
         <div className="animate-fade-in">
-          {renderAudioControls(!!content)}
+          
+          {renderAudioControlSection('Lesson')}
 
-          {/* Main Content */}
-          <div className="bg-white dark:bg-slate-900/50 rounded-2xl p-6 md:p-10 border border-slate-200 dark:border-white/5 shadow-2xl backdrop-blur-sm relative group">
-            {content && (
-              <button
-                onClick={() => handleCopy(content)}
-                className="absolute top-4 right-4 p-2 bg-slate-100 dark:bg-slate-800/80 hover:bg-indigo-600 text-slate-400 hover:text-white rounded-lg transition-all border border-slate-200 dark:border-white/10 shadow-lg z-10 opacity-100 md:opacity-0 md:group-hover:opacity-100"
-                title="Copy to clipboard"
-              >
-                {copied ? <Check className="w-5 h-5 text-green-400" /> : <Copy className="w-5 h-5" />}
-              </button>
-            )}
-            {content && <MarkdownRenderer content={content} />}
+          <div className="bg-white dark:bg-slate-900/50 rounded-2xl p-6 md:p-10 border border-slate-200 dark:border-white/5 shadow-2xl relative group">
+             <button
+               onClick={() => handleCopy(content)}
+               className="absolute top-4 right-4 p-2 bg-slate-100 dark:bg-slate-800 text-slate-400 hover:text-indigo-600 rounded-lg transition-all opacity-0 group-hover:opacity-100"
+             >
+               {copied ? <Check className="w-5 h-5 text-green-500" /> : <Copy className="w-5 h-5" />}
+             </button>
+             <MarkdownRenderer content={content || ''} />
           </div>
 
-          {/* Quiz Section */}
+          {/* Quiz */}
           <div className="mt-16 bg-gradient-to-br from-indigo-50 to-purple-50 dark:from-indigo-900/20 dark:to-purple-900/20 rounded-3xl p-8 border border-indigo-200 dark:border-indigo-500/20">
-            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
-              <h2 className="text-2xl font-bold text-slate-800 dark:text-white flex items-center gap-3">
-                <div className="bg-green-100 dark:bg-green-500/20 p-2 rounded-lg">
-                  <BookOpenCheck className="text-green-600 dark:text-green-400 w-6 h-6" />
-                </div>
-                Knowledge Check
-              </h2>
-              {!quizContent && (
-                <button
-                  onClick={handleGenerateQuiz}
-                  disabled={quizLoading}
-                  className="flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl font-bold transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg hover:shadow-indigo-500/30 transform hover:-translate-y-0.5"
-                >
-                  {quizLoading ? <Loader2 className="animate-spin w-5 h-5" /> : <RefreshCw className="w-5 h-5" />}
-                  Generate Quiz
-                </button>
-              )}
+            <div className="flex items-center justify-between mb-8">
+               <h2 className="text-2xl font-bold flex items-center gap-3 text-slate-800 dark:text-white">
+                 <BookOpenCheck className="text-green-500" /> Knowledge Check
+               </h2>
+               {!quizContent && (
+                  <button 
+                    onClick={handleGenerateQuiz}
+                    disabled={quizLoading}
+                    className="flex items-center gap-2 px-5 py-2 bg-indigo-600 text-white rounded-xl font-bold hover:bg-indigo-700 transition-all disabled:opacity-50"
+                  >
+                    {quizLoading ? <Loader2 className="animate-spin w-4 h-4" /> : <RefreshCw className="w-4 h-4" />} Generate Quiz
+                  </button>
+               )}
             </div>
-
-            {quizContent && (
-              <div className="animate-fade-in shadow-inner">
-                 <QuizView rawContent={quizContent} />
-              </div>
-            )}
+            {quizContent && <QuizView rawContent={quizContent} />}
           </div>
         </div>
       )}
 
-      {/* SUMMARY TAB CONTENT */}
+      {/* SUMMARY TAB */}
       {activeTab === 'summary' && (
         <div className="animate-fade-in">
-          {summaryLoading ? (
-            <div className="flex flex-col items-center justify-center py-20 text-slate-500 dark:text-slate-400">
-               <Loader2 className="w-12 h-12 animate-spin text-purple-500 mb-4" />
-               <p className="text-lg animate-pulse">Synthesizing key points...</p>
-            </div>
-          ) : (
-            <>
-              {renderAudioControls(!!summaryContent)}
-
-              <div className="bg-white dark:bg-slate-900/50 rounded-2xl p-6 md:p-10 border border-slate-200 dark:border-white/5 shadow-2xl backdrop-blur-sm relative overflow-hidden group">
-                <div className="absolute top-0 right-0 p-8 opacity-10 pointer-events-none">
-                    <Sparkles className="w-32 h-32 text-purple-500" />
-                </div>
-                {summaryContent && (
+           {summaryLoading ? (
+             <div className="py-20 flex flex-col items-center justify-center">
+                <Loader2 className="w-10 h-10 animate-spin text-purple-500 mb-4" />
+                <p className="text-slate-500 animate-pulse font-medium">Generating Summary...</p>
+             </div>
+           ) : (
+             <>
+               {renderAudioControlSection('Summary')}
+               
+               <div className="bg-white dark:bg-slate-900/50 rounded-2xl p-8 border border-slate-200 dark:border-white/5 shadow-2xl relative overflow-hidden group">
+                  <div className="absolute top-0 right-0 p-8 opacity-10 pointer-events-none">
+                     <Sparkles className="w-32 h-32 text-purple-500" />
+                  </div>
                   <button
                     onClick={() => handleCopy(summaryContent)}
-                    className="absolute top-4 right-4 p-2 bg-slate-100 dark:bg-slate-800/80 hover:bg-purple-600 text-slate-400 hover:text-white rounded-lg transition-all border border-slate-200 dark:border-white/10 shadow-lg z-10 opacity-100 md:opacity-0 md:group-hover:opacity-100"
-                    title="Copy summary"
+                    className="absolute top-4 right-4 p-2 bg-slate-100 dark:bg-slate-800 text-slate-400 hover:text-purple-600 rounded-lg transition-all opacity-0 group-hover:opacity-100"
                   >
-                    {copied ? <Check className="w-5 h-5 text-green-400" /> : <Copy className="w-5 h-5" />}
+                    {copied ? <Check className="w-5 h-5 text-green-500" /> : <Copy className="w-5 h-5" />}
                   </button>
-                )}
-                 {summaryContent ? (
-                    <MarkdownRenderer content={summaryContent} />
-                 ) : (
-                   <div className="text-center py-10 text-slate-500">
-                      Failed to load summary.
-                   </div>
-                 )}
-              </div>
-            </>
-          )}
+                  {summaryContent ? <MarkdownRenderer content={summaryContent} /> : <p>No summary available.</p>}
+               </div>
+             </>
+           )}
         </div>
       )}
-
     </div>
   );
 };

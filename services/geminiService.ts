@@ -96,7 +96,28 @@ export const generateQuizForTopic = async (topicTitle: string): Promise<string> 
   }
 };
 
-// --- AUDIO GENERATION (NATIVE STUB) ---
+// --- AUDIO GENERATION (GEMINI TTS) ---
+
 export const generateSpeechForText = async (text: string, voiceName: string = 'Kore'): Promise<string | null> => {
-  return null;
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash-preview-tts",
+      contents: [{ parts: [{ text: text }] }],
+      config: {
+        responseModalities: ["AUDIO"],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: voiceName },
+          },
+        },
+      },
+    });
+
+    // Extract base64 audio data
+    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    return base64Audio || null;
+  } catch (error) {
+    console.error("Speech Generation Error:", error);
+    return null;
+  }
 };
